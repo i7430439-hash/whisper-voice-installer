@@ -574,10 +574,32 @@ def step_create_venv(install_path: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def step_install_dependencies(install_path: Path) -> None:
+def _write_cpu_requirements(source: Path, dest: Path) -> int:
+    """Copy `source` to `dest` with all nvidia-* package lines stripped.
+
+    Returns the number of lines removed. Comments and blank lines pass through.
+    """
+    lines = source.read_text(encoding="utf-8").splitlines()
+    kept = [ln for ln in lines if not ln.lstrip().lower().startswith("nvidia-")]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return len(lines) - len(kept)
+
+
+def step_install_dependencies(install_path: Path, device: str) -> None:
     uv = _find_uv_executable()
     venv_python = install_path / ".venv" / "Scripts" / "python.exe"
     requirements = install_path / "requirements.txt"
+    if device == "cpu":
+        # Strip nvidia-* lines before handing to uv. Installing those wheels
+        # on a CPU-only machine wastes ~2 GB AND ships DLLs that crash
+        # faster_whisper at import (exit 0xC0000005) when no NVIDIA driver
+        # is present. Original repo requirements.txt is left untouched -
+        # cuda installs still need it as-is.
+        cpu_requirements = Path(tempfile.gettempdir()) / "wv-bootstrap" / "requirements_cpu.txt"
+        removed = _write_cpu_requirements(requirements, cpu_requirements)
+        info(f"  filtered nvidia-* lines for cpu install ({removed} removed) -> {cpu_requirements}")
+        requirements = cpu_requirements
     cmd = [
         uv, "pip", "install",
         "-r", str(requirements),
@@ -587,18 +609,39 @@ def step_install_dependencies(install_path: Path) -> None:
     subprocess.run(cmd, check=True)
 
 
-def step_copy_cuda_dlls(install_path: Path) -> None:
+def step_copy_cuda_dlls(install_path: Path, device: str) -> None:
     """Mirror .venv\\Lib\\site-packages\\nvidia\\*\\bin\\*.dll into .venv\\Scripts\\.
 
     ctranslate2 4.7.1 stopped declaring nvidia-cublas-cu12 / nvidia-cudnn-cu12
     as deps, and its DLL search path is python.exe's directory + system PATH
     only - the per-package nvidia\\<lib>\\bin folders are on neither, so
     transcription crashes with 'cublas64_12.dll is not found' otherwise.
-    No-op when the nvidia\\ tree is absent (cpu-only install).
+
+    No-op when device == "cpu". Even if nvidia-* wheels somehow ended up in
+    the venv on a cpu install, copying their DLLs next to python.exe would
+    crash faster_whisper at import (0xC0000005) on a driver-less machine.
     """
     venv = install_path / ".venv"
-    nvidia_root = venv / "Lib" / "site-packages" / "nvidia"
     scripts = venv / "Scripts"
+    if device != "cpu" and device != "cuda":
+        warn(f"unexpected device '{device}' - skipping CUDA DLL copy")
+        return
+    if device == "cpu":
+        # Defensive sweep: log any stray CUDA DLLs that slipped through filter (b).
+        stray: list[Path] = []
+        if scripts.is_dir():
+            for pattern in ("cublas*.dll", "cudnn*.dll", "cuda*.dll", "nvrtc*.dll"):
+                stray.extend(sorted(scripts.glob(pattern)))
+        if stray:
+            warn(
+                "cpu install but found CUDA DLLs in .venv\\Scripts: "
+                + ", ".join(p.name for p in stray)
+                + " - app may crash on launch"
+            )
+        else:
+            info("  skipped: device='cpu', no CUDA DLLs needed (.venv\\Scripts verified clean)")
+        return
+    nvidia_root = venv / "Lib" / "site-packages" / "nvidia"
     if not nvidia_root.is_dir():
         info("  nvidia\\ tree not present (cpu-only deps); nothing to copy")
         return
@@ -778,9 +821,9 @@ def phase3_install(facts: dict, runtime: dict) -> None:
              console_label="download assets")
     run_step("create .venv", lambda: step_create_venv(install_path), critical=True,
              console_label="create .venv (Python 3.12)")
-    run_step("install dependencies", lambda: step_install_dependencies(install_path), critical=True,
+    run_step("install dependencies", lambda: step_install_dependencies(install_path, device), critical=True,
              console_label="install dependencies")
-    run_step("copy CUDA runtime DLLs", lambda: step_copy_cuda_dlls(install_path),
+    run_step("copy CUDA runtime DLLs", lambda: step_copy_cuda_dlls(install_path, device),
              critical=(device == "cuda"),
              console_label="copy CUDA runtime DLLs")
     run_step("copy portable runtime", lambda: step_copy_runtime(install_path), critical=True,
