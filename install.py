@@ -663,19 +663,33 @@ def step_copy_cuda_dlls(install_path: Path, device: str) -> None:
 
 
 def _find_uv_python_root() -> Path | None:
-    """Locate the portable Python tree uv unpacked. Mirrors v1.1 logic."""
+    """Locate the portable Python tree uv unpacked.
+
+    Prefers the dotted version folder (cpython-3.12.X-windows-x86_64-none)
+    over the junction (cpython-3.12-windows-x86_64-none). File stats through
+    the junction are unreliable on Windows (Defender / reparse-point quirks),
+    which can break shutil.copytree mid-copy. Falls back to whatever is there
+    if no dotted folder exists.
+    """
     candidate_roots = [
         Path(os.environ.get("APPDATA", "")) / "uv" / "python",
         Path(os.environ.get("USERPROFILE", "")) / ".local" / "share" / "uv" / "python",
         Path(os.environ.get("LOCALAPPDATA", "")) / "uv" / "python",
     ]
+    fallback: Path | None = None
     for root in candidate_roots:
         if not root.exists():
             continue
         for entry in root.iterdir():
-            if entry.is_dir() and entry.name.startswith("cpython-3.12"):
+            if not (entry.is_dir() and entry.name.startswith("cpython-3.12")):
+                continue
+            # Real folder name has "3.12." (dotted version, e.g. 3.12.13);
+            # junction name has "3.12-" (no dot after major.minor).
+            if "3.12." in entry.name:
                 return entry
-    return None
+            if fallback is None:
+                fallback = entry
+    return fallback
 
 
 def step_copy_runtime(install_path: Path) -> None:
@@ -1008,6 +1022,10 @@ def main() -> int:
         info(f"started at {datetime.datetime.now().isoformat(timespec='seconds')}")
         info(f"python: {sys.version.split()[0]} ({sys.executable})")
         info(f"log:    {TEMP_LOG_PATH}")
+        # Diagnostic: which python is *really* running. Useful for spotting
+        # uv junction-vs-real-folder mismatches (Defender / reparse-point quirk).
+        debug(f"sys.executable realpath: {os.path.realpath(sys.executable)}")
+        debug(f"os.__file__: {os.__file__}")
 
         facts = phase1_preflight()
         runtime = phase2_user_input(facts)

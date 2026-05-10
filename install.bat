@@ -123,9 +123,39 @@ if errorlevel 1 (
 )
 call :stamp "python 3.12 installed"
 
+rem ---- resolve REAL (non-junction) Python 3.12 path ----
+rem uv creates two dirs on Windows under %APPDATA%\uv\python\:
+rem   cpython-3.12-windows-x86_64-none      <- junction (no dot after 3.12)
+rem   cpython-3.12.X-windows-x86_64-none    <- real folder (dotted version)
+rem Junction-relative file access is unreliable (Defender / reparse-point
+rem quirk: dir listing works, individual file stat fails), so pip install
+rem and the python.exe handoff must both use the real folder path.
+set "PY312_REAL="
+for /d %%D in ("%APPDATA%\uv\python\cpython-3.12.*-windows-x86_64-none") do (
+    if not defined PY312_REAL (
+        if exist "%%D\python.exe" set "PY312_REAL=%%D\python.exe"
+    )
+)
+if not defined PY312_REAL (
+    rem fallback for unexpected layouts: take any cpython-3.12* dir, junction or not
+    for /d %%D in ("%APPDATA%\uv\python\cpython-3.12*-windows-x86_64-none") do (
+        if not defined PY312_REAL (
+            if exist "%%D\python.exe" set "PY312_REAL=%%D\python.exe"
+        )
+    )
+)
+if not defined PY312_REAL (
+    call :info "[FAIL] could not locate Python 3.12 under %APPDATA%\uv\python"
+    goto :die
+)
+call :stamp "python 3.12 real path: !PY312_REAL!"
+
 rem ---- step 6: pynvml in bootstrap python (NON-critical) ----
 call :info "[6/7] Installing pynvml for GPU detection..."
-"!UV!" pip install --system --python 3.12 nvidia-ml-py >> "%LOG%" 2>&1
+rem --break-system-packages: uv-managed Python is "externally managed"
+rem and rejects pip install otherwise. --python with the REAL path avoids
+rem the junction site-packages quirk (see PY312_REAL block above).
+"!UV!" pip install --break-system-packages --python "!PY312_REAL!" nvidia-ml-py >> "%LOG%" 2>&1
 if errorlevel 1 (
     call :warn "pynvml install failed - install.py will treat this as no GPU and continue"
 ) else (
@@ -156,7 +186,9 @@ echo   Bootstrap done. Starting installer...
 echo ============================================================
 echo.
 call :stamp "=== handing off to install.py ==="
-"!UV!" run --python 3.12 python.exe -X utf8 "%INSTALL_PY%"
+rem invoke real python.exe directly - NOT `uv run --python 3.12`, which
+rem resolves to the junction and breaks `import pynvml` inside install.py
+"!PY312_REAL!" -X utf8 "%INSTALL_PY%"
 set "EXITCODE=!ERRORLEVEL!"
 call :stamp "=== install.py exited with code !EXITCODE! ==="
 
