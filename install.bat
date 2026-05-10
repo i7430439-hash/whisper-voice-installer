@@ -125,7 +125,7 @@ call :stamp "python 3.12 installed"
 
 rem ---- step 6: pynvml in bootstrap python (NON-critical) ----
 call :info "[6/7] Installing pynvml for GPU detection..."
-"!UV!" pip install --python 3.12 nvidia-ml-py >> "%LOG%" 2>&1
+"!UV!" pip install --system --python 3.12 nvidia-ml-py >> "%LOG%" 2>&1
 if errorlevel 1 (
     call :warn "pynvml install failed - install.py will treat this as no GPU and continue"
 ) else (
